@@ -1,4 +1,6 @@
-from flask import Flask, request, jsonify, render_template
+from flask import Flask, request, jsonify, render_template, Response
+import time
+import json
 from flask_cors import CORS
 import database
 import ai_engine
@@ -123,6 +125,18 @@ def clear_data():
 @app.route('/api/progress', methods=['GET'])
 def get_progress():
     return jsonify(ai_engine.get_progress())
+
+@app.route('/api/stream_progress')
+def stream_progress():
+    def event_stream():
+        last_state = None
+        while True:
+            current_state = ai_engine.get_progress()
+            if current_state != last_state:
+                yield f"data: {json.dumps(current_state)}\n\n"
+                last_state = current_state.copy()
+            time.sleep(1)
+    return Response(event_stream(), mimetype="text/event-stream")
 
 @app.route('/api/rerun_ai', methods=['POST'])
 def rerun_ai():

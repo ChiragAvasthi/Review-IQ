@@ -1,5 +1,5 @@
-import threading
-import queue
+import concurrent.futures
+import json
 import uuid
 import datetime
 import re           
@@ -9,14 +9,7 @@ from sklearn.cluster import KMeans
 from sklearn.feature_extraction.text import TfidfVectorizer
 import database
 
-# Task queue and progress state
-task_queue = queue.Queue()
-progress_state = {
-    'task': 'None',
-    'message': 'Idle',
-    'percent': 0,
-    'busy': False
-}
+executor = None
 
 sentiment_model = None
 absa_model = None
@@ -25,20 +18,20 @@ summarizer_model = None
 def load_models():
     global sentiment_model, absa_model, summarizer_model
     if not sentiment_model:
-        progress_state['message'] = 'Loading Sentiment Model...'
+        update_progress('init', 'Loading Sentiment Model...', 0)
         try:
             sentiment_model = pipeline('sentiment-analysis', model='distilbert-base-uncased-finetuned-sst-2-english')
         except Exception as e:
             print(f"Failed to load sentiment model: {e}")
     if not absa_model:
-        progress_state['message'] = 'Loading ABSA Model...'
+        update_progress('init', 'Loading ABSA Model...', 0)
         try:
             absa_model = pipeline('zero-shot-classification', model='cross-encoder/nli-distilroberta-base')
         except Exception as e:
             print(f"Failed to load ABSA model: {e}")
             absa_model = None
     if not summarizer_model:
-        progress_state['message'] = 'Loading Summarizer...'
+        update_progress('init', 'Loading Summarizer...', 0)
         try:
             summarizer_model = pipeline('summarization', model='sshleifer/distilbart-cnn-12-6')
         except Exception as e:
@@ -46,13 +39,19 @@ def load_models():
             summarizer_model = None
 
 def get_progress():
-    return progress_state
+    settings = database.get_settings()
+    prog_str = settings.get('progress_json')
+    if prog_str:
+        return json.loads(prog_str)
+    return {'task': 'None', 'message': 'Idle', 'percent': 0, 'busy': False}
 
+_last_progress = None
 def update_progress(task, message, percent, busy=True):
-    progress_state['task'] = task
-    progress_state['message'] = message
-    progress_state['percent'] = percent
-    progress_state['busy'] = busy
+    global _last_progress
+    prog = {'task': task, 'message': message, 'percent': percent, 'busy': busy}
+    if prog != _last_progress:
+        database.save_settings({'progress_json': json.dumps(prog)})
+        _last_progress = prog
 
 def process_sentiment():
     update_progress('sentiment', 'Initializing...', 0)
@@ -188,10 +187,13 @@ def process_clustering(k):
                 groups[prod] = []
             groups[prod].append(r)
             
-    c.executescript('DELETE FROM review_themes; DELETE FROM themes;')
+    conn.close() # Close connection to release any read locks during ML processing
     
     total_groups = len(groups)
     current_group = 0
+    
+    all_themes_to_insert = []
+    all_review_themes_to_insert = []
     
     for prod_name, reviews in groups.items():
         if len(reviews) < 3: 
@@ -231,44 +233,40 @@ def process_clustering(k):
             
         for t in themes:
             if t['review_ids']:
-                c.execute('INSERT INTO themes (id, name, keywords, color, product, summary) VALUES (?, ?, ?, ?, ?, ?)', 
-                          (t['id'], t['name'], t['keywords'], t['color'], t['product'], t['summary']))
+                all_themes_to_insert.append((t['id'], t['name'], t['keywords'], t['color'], t['product'], t['summary']))
                 for rid in t['review_ids']:
-                    # Only map review to theme if it's the Global run OR the specific product run
-                    c.execute('INSERT INTO review_themes (id, review_id, theme_id, relevance_score) VALUES (?, ?, ?, ?)',
-                              (str(uuid.uuid4()), rid, t['id'], 1.0))
+                    all_review_themes_to_insert.append((str(uuid.uuid4()), rid, t['id'], 1.0))
                               
         current_group += 1
                               
+    # Now that ML is done, quickly write everything to DB
+    conn = database.get_connection()
+    c = conn.cursor()
+    c.executescript('DELETE FROM review_themes; DELETE FROM themes;')
+    
+    c.executemany('INSERT INTO themes (id, name, keywords, color, product, summary) VALUES (?, ?, ?, ?, ?, ?)', all_themes_to_insert)
+    c.executemany('INSERT INTO review_themes (id, review_id, theme_id, relevance_score) VALUES (?, ?, ?, ?)', all_review_themes_to_insert)
+    
     conn.commit()
     conn.close()
     update_progress('cluster', 'Clustering Complete', 100, False)
     
-    # Automatically trigger sentiment after clustering
-    task_queue.put({'type': 'sentiment'})
+    # Sentiment is now called sequentially by run_pipeline
 
-def worker_loop():
-    while True:
-        task = task_queue.get()
-        if task is None:
-            break
-        try:
-            if task['type'] == 'sentiment':
-                process_sentiment()
-            elif task['type'] == 'cluster':
-                process_clustering(task['k'])
-        except Exception as e:
-            print(f"Error in background task: {e}")
-            update_progress('error', f'Error: {str(e)}', 0, False)
-        finally:
-            task_queue.task_done()
-
-# Start background thread
-worker_thread = threading.Thread(target=worker_loop, daemon=True)
-worker_thread.start()
+def run_pipeline(k):
+    try:
+        process_clustering(k)
+        process_sentiment()
+    except Exception as e:
+        print(f"Error in background process: {e}")
+        update_progress('error', f'Error: {str(e)}', 0, False)
 
 def trigger_analysis():
+    global executor
+    if executor is None:
+        executor = concurrent.futures.ProcessPoolExecutor(max_workers=1)
+    
     settings = database.get_settings()
     theme_count = int(settings.get('theme_count', 6))
-    task_queue.put({'type': 'cluster', 'k': theme_count})
+    executor.submit(run_pipeline, theme_count)
 

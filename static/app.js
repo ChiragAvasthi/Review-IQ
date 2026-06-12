@@ -35,8 +35,8 @@ async function init() {
   await loadSettings();
   await checkTrends();
 
-  // Setup Progress Polling
-  setInterval(pollProgress, 2000);
+  // Setup Server-Sent Events for Progress
+  setupSSE();
 }
 
 // --- API Helpers ---
@@ -61,15 +61,21 @@ async function fetchAPI(endpoint, method = 'GET', body = null, skipProductInject
   return await res.json();
 }
 
-async function pollProgress() {
-  try {
-    const data = await fetchAPI('/progress');
-    if (data.task !== 'None') {
-      updateProgress(data);
+function setupSSE() {
+  const eventSource = new EventSource(`${API_BASE}/stream_progress`);
+  eventSource.onmessage = function(event) {
+    try {
+      const data = JSON.parse(event.data);
+      if (data.task !== 'None') {
+        updateProgress(data);
+      }
+    } catch (err) {
+      console.error('SSE Error:', err);
     }
-  } catch (err) {
-    console.error('Progress poll failed', err);
-  }
+  };
+  eventSource.onerror = function() {
+    console.error('SSE connection lost, reconnecting...');
+  };
 }
 
 // --- Navigation ---
