@@ -106,9 +106,9 @@ def init_db():
     ''')
     
     # Safe migrations for existing databases
-    for table, col in [('reviews', 'product'), ('themes', 'product'), ('weekly_snapshots', 'product'), ('reviews', 'metadata'), ('themes', 'summary')]:
+    for table, col in [('reviews', 'product'), ('themes', 'product'), ('weekly_snapshots', 'product'), ('reviews', 'metadata'), ('themes', 'summary'), ('analysis', 'is_anomaly')]:
         try:
-            default_val = '"{}"' if col == 'metadata' else ('"Global"' if col == 'product' else 'NULL')
+            default_val = '"{}"' if col == 'metadata' else ('"Global"' if col == 'product' else ('0' if col == 'is_anomaly' else 'NULL'))
             c.execute(f'ALTER TABLE {table} ADD COLUMN {col} TEXT DEFAULT {default_val}')
         except sqlite3.OperationalError:
             pass

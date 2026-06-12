@@ -1,5 +1,4 @@
 flask==3.0.3
 flask-cors==4.0.1
 scikit-learn==1.4.2
-torch==2.3.0
-transformers==4.40.1
+nltk==3.8.1

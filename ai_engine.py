@@ -2,41 +2,30 @@ import concurrent.futures
 import json
 import uuid
 import datetime
-import re           
-# pyrefly: ignore [missing-import]
-from transformers import pipeline
-from sklearn.cluster import KMeans
+import re
+import nltk
+from nltk.sentiment.vader import SentimentIntensityAnalyzer
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.decomposition import LatentDirichletAllocation
+from sklearn.ensemble import IsolationForest
 import database
 
 executor = None
-
 sentiment_model = None
-absa_model = None
-summarizer_model = None
 
 def load_models():
-    global sentiment_model, absa_model, summarizer_model
+    global sentiment_model
     if not sentiment_model:
-        update_progress('init', 'Loading Sentiment Model...', 0)
+        update_progress('init', 'Loading VADER Sentiment Model...', 0)
         try:
-            sentiment_model = pipeline('sentiment-analysis', model='distilbert-base-uncased-finetuned-sst-2-english')
+            sentiment_model = SentimentIntensityAnalyzer()
         except Exception as e:
-            print(f"Failed to load sentiment model: {e}")
-    if not absa_model:
-        update_progress('init', 'Loading ABSA Model...', 0)
-        try:
-            absa_model = pipeline('zero-shot-classification', model='cross-encoder/nli-distilroberta-base')
-        except Exception as e:
-            print(f"Failed to load ABSA model: {e}")
-            absa_model = None
-    if not summarizer_model:
-        update_progress('init', 'Loading Summarizer...', 0)
-        try:
-            summarizer_model = pipeline('summarization', model='sshleifer/distilbart-cnn-12-6')
-        except Exception as e:
-            print(f"Failed to load Summarizer model: {e}")
-            summarizer_model = None
+            print(f"Failed to load VADER sentiment model: {e}")
+            try:
+                nltk.download('vader_lexicon', quiet=True)
+                sentiment_model = SentimentIntensityAnalyzer()
+            except:
+                pass
 
 def get_progress():
     settings = database.get_settings()
@@ -64,13 +53,14 @@ def process_sentiment():
     
     if not reviews:
         update_progress('sentiment', 'No new reviews to analyze', 100, False)
+        conn.close()
         return
 
     settings = database.get_settings()
     neutral_threshold = float(settings.get('neutral_threshold', 0.65))
     
     total = len(reviews)
-    batch_size = 32
+    batch_size = 100
     processed = 0
     
     c.execute('SELECT DISTINCT name FROM themes')
@@ -80,19 +70,26 @@ def process_sentiment():
 
     for i in range(0, total, batch_size):
         batch = reviews[i:i+batch_size]
-        texts = [r['text'] if r['text'] else '' for r in batch]
         
-        # Aggressive truncation for massive speedup on CPU. 
-        texts_trunc = [t[:250] for t in texts]
-        results = sentiment_model(texts_trunc)
-        
-        for idx, res in enumerate(results):
-            label = res['label']
-            score = res['score']
-            if score < neutral_threshold:
+        for idx, r in enumerate(batch):
+            text = r['text'] if r['text'] else ''
+            if not text.strip():
+                continue
+                
+            res = sentiment_model.polarity_scores(text)
+            compound = res['compound']
+            
+            # Map [-1, 1] to [0, 1] for our score
+            score = (compound + 1.0) / 2.0
+            
+            if compound > 0.05:
+                label = 'POSITIVE'
+            elif compound < -0.05:
+                label = 'NEGATIVE'
+            else:
                 label = 'NEUTRAL'
                 
-            rev_id = batch[idx]['id']
+            rev_id = r['id']
             c.execute('''
                 INSERT OR REPLACE INTO analysis (id, review_id, sentiment_label, sentiment_score, processed_at)
                 VALUES (?, ?, ?, ?, ?)
@@ -100,59 +97,68 @@ def process_sentiment():
                 str(uuid.uuid4()), rev_id, label, score, datetime.datetime.utcnow().isoformat()
             ))
             
-            # Aspect-Based Sentiment Analysis (ABSA)
-            if absa_model:
-                raw_text = batch[idx]['text']
-                if raw_text:
-                    sentences = [s.strip() for s in re.split(r'(?<=[.!?]) +', raw_text) if len(s.strip()) > 10][:3]
-                    for sentence in sentences:
-                        try:
-                            absa_res = absa_model(sentence, candidate_labels=candidate_themes)
-                            top_aspect = absa_res['labels'][0]
-                            top_aspect_score = absa_res['scores'][0]
-                            if top_aspect_score > 0.4:
-                                sent_res = sentiment_model(sentence[:250])[0]
-                                s_label = sent_res['label']
-                                s_score = sent_res['score']
-                                if s_score < neutral_threshold: s_label = 'NEUTRAL'
-                                
-                                c.execute('''
-                                    INSERT INTO review_aspects (id, review_id, aspect_name, sentiment_label, sentiment_score)
-                                    VALUES (?, ?, ?, ?, ?)
-                                ''', (str(uuid.uuid4()), rev_id, top_aspect, s_label, s_score))
-                        except Exception as e:
-                            pass
+            # Simple Aspect-Based Sentiment Analysis using VADER & Keyword Matching
+            sentences = [s.strip() for s in re.split(r'(?<=[.!?]) +', text) if len(s.strip()) > 10][:3]
+            for sentence in sentences:
+                sent_res = sentiment_model.polarity_scores(sentence)
+                s_comp = sent_res['compound']
+                
+                s_label = 'NEUTRAL'
+                if s_comp > 0.05: s_label = 'POSITIVE'
+                elif s_comp < -0.05: s_label = 'NEGATIVE'
+                s_score = (s_comp + 1.0) / 2.0
+                
+                matched_theme = None
+                sentence_lower = sentence.lower()
+                for theme in candidate_themes:
+                    theme_words = theme.lower().split()
+                    if any(tw in sentence_lower for tw in theme_words if len(tw) > 3):
+                        matched_theme = theme
+                        break
+                        
+                if matched_theme and s_label != 'NEUTRAL':
+                    c.execute('''
+                        INSERT INTO review_aspects (id, review_id, aspect_name, sentiment_label, sentiment_score)
+                        VALUES (?, ?, ?, ?, ?)
+                    ''', (str(uuid.uuid4()), rev_id, matched_theme, s_label, s_score))
                             
         conn.commit()
         processed += len(batch)
         update_progress('sentiment', 'Analyzing sentiment & aspects...', int((processed/total)*100))
         
     conn.close()
-    update_progress('sentiment', 'AI Analysis Complete', 100, False)
+    update_progress('sentiment', 'Sentiment Analysis Complete', 100, False)
 
-def extract_keywords(texts, k):
-    if not texts:
+def extract_keywords_lda(texts, k):
+    if not texts or len(texts) < 2:
         return []
-    vectorizer = TfidfVectorizer(stop_words='english', max_features=1000)
-    X = vectorizer.fit_transform(texts)
+    
+    # Use n-grams (1 to 3) for more meaningful phrases instead of single words
+    vectorizer = TfidfVectorizer(stop_words='english', max_features=1000, ngram_range=(1, 3))
+    try:
+        X = vectorizer.fit_transform(texts)
+    except ValueError:
+        return [] # vocabulary empty
+        
     feature_names = vectorizer.get_feature_names_out()
     
-    kmeans = KMeans(n_clusters=k, random_state=42, n_init='auto')
-    kmeans.fit(X)
+    lda = LatentDirichletAllocation(n_components=k, random_state=42, max_iter=5)
+    doc_topics = lda.fit_transform(X)
     
-    order_centroids = kmeans.cluster_centers_.argsort()[:, ::-1]
     clusters_keywords = []
-    
-    distances = kmeans.transform(X)
-    closest_indices = []
-    
-    for i in range(k):
-        top_words = [feature_names[ind] for ind in order_centroids[i, :5]]
+    for topic_idx, topic in enumerate(lda.components_):
+        top_words_idx = topic.argsort()[:-6:-1]
+        top_words = [feature_names[i] for i in top_words_idx]
         clusters_keywords.append(top_words)
-        sorted_idx = distances[:, i].argsort()[:5]
+        
+    labels = doc_topics.argmax(axis=1)
+    
+    closest_indices = []
+    for i in range(k):
+        sorted_idx = doc_topics[:, i].argsort()[::-1][:5]
         closest_indices.append(sorted_idx.tolist())
         
-    return clusters_keywords, kmeans.labels_, closest_indices
+    return clusters_keywords, labels, closest_indices
 
 def assign_theme_name(keywords):
     k_str = ' '.join(keywords).lower()
@@ -167,7 +173,6 @@ THEME_COLORS = ['#185FA5', '#F5A623', '#7ED321', '#D0021B', '#9013FE', '#4A90E2'
 
 def process_clustering(k):
     update_progress('cluster', 'Initializing clustering...', 0)
-    load_models()
     
     conn = database.get_connection()
     c = conn.cursor()
@@ -176,9 +181,9 @@ def process_clustering(k):
     
     if not reviews_raw:
         update_progress('cluster', 'No reviews to cluster', 100, False)
+        conn.close()
         return
         
-    # Group by product and create a Global group
     groups = {'Global': reviews_raw}
     for r in reviews_raw:
         prod = r['product'] or 'Global'
@@ -187,7 +192,7 @@ def process_clustering(k):
                 groups[prod] = []
             groups[prod].append(r)
             
-    conn.close() # Close connection to release any read locks during ML processing
+    conn.close() 
     
     total_groups = len(groups)
     current_group = 0
@@ -197,29 +202,29 @@ def process_clustering(k):
     
     for prod_name, reviews in groups.items():
         if len(reviews) < 3: 
-            continue # Skip clustering for extremely sparse products
+            current_group += 1
+            continue
             
         texts = [r['text'] if r['text'] else '' for r in reviews]
         update_progress('cluster', f'Extracting keywords for {prod_name}...', int((current_group/total_groups)*100))
         
-        clusters_keywords, labels, closest_indices = extract_keywords(texts, min(k, len(texts)))
+        result = extract_keywords_lda(texts, min(k, len(texts)))
+        if not result:
+            current_group += 1
+            continue
+            
+        clusters_keywords, labels, closest_indices = result
         
         themes = []
         for i in range(len(clusters_keywords)):
             keywords = clusters_keywords[i]
             
-            # Generate summary from top 5 closest reviews
+            # Simple Extractive Summary (take the first 150 chars of the most representative review)
             summary_text = ""
-            if summarizer_model and i < len(closest_indices):
-                top_5_idx = closest_indices[i]
-                combined_text = " ".join([texts[idx] for idx in top_5_idx if idx < len(texts)])
-                trunc = combined_text[:800]
-                if len(trunc) > 50:
-                    try:
-                        summ = summarizer_model(trunc, max_length=40, min_length=10, do_sample=False)
-                        summary_text = summ[0]['summary_text'].strip()
-                    except:
-                        pass
+            if i < len(closest_indices):
+                top_idx = closest_indices[i]
+                if top_idx and top_idx[0] < len(texts):
+                    summary_text = texts[top_idx[0]][:150] + "..."
                         
             themes.append({
                 'id': str(uuid.uuid4()),
@@ -239,7 +244,6 @@ def process_clustering(k):
                               
         current_group += 1
                               
-    # Now that ML is done, quickly write everything to DB
     conn = database.get_connection()
     c = conn.cursor()
     c.executescript('DELETE FROM review_themes; DELETE FROM themes;')
@@ -250,15 +254,42 @@ def process_clustering(k):
     conn.commit()
     conn.close()
     update_progress('cluster', 'Clustering Complete', 100, False)
+
+def process_anomalies():
+    update_progress('anomaly', 'Detecting anomalies...', 0)
+    conn = database.get_connection()
+    c = conn.cursor()
+    c.execute('SELECT id, text FROM reviews')
+    reviews_raw = c.fetchall()
     
-    # Sentiment is now called sequentially by run_pipeline
+    if len(reviews_raw) > 5:
+        texts = [r['text'] if r['text'] else '' for r in reviews_raw]
+        vectorizer = TfidfVectorizer(stop_words='english', max_features=500)
+        try:
+            X = vectorizer.fit_transform(texts)
+            iso_forest = IsolationForest(contamination=0.05, random_state=42)
+            anomaly_labels = iso_forest.fit_predict(X)
+            
+            anomalous_ids = [(reviews_raw[i]['id'],) for i, label in enumerate(anomaly_labels) if label == -1]
+            
+            if anomalous_ids:
+                c.executemany('UPDATE analysis SET is_anomaly = 1 WHERE review_id = ?', anomalous_ids)
+                conn.commit()
+        except ValueError:
+            pass
+            
+    conn.close()
+    update_progress('anomaly', 'Anomaly Detection Complete', 100, False)
 
 def run_pipeline(k):
     try:
         process_clustering(k)
         process_sentiment()
+        process_anomalies()
+        update_progress('done', 'AI Analysis Complete', 100, False)
     except Exception as e:
-        print(f"Error in background process: {e}")
+        import traceback
+        print(f"Error in background process: {e}\n{traceback.format_exc()}")
         update_progress('error', f'Error: {str(e)}', 0, False)
 
 def trigger_analysis():
@@ -269,4 +300,3 @@ def trigger_analysis():
     settings = database.get_settings()
     theme_count = int(settings.get('theme_count', 6))
     executor.submit(run_pipeline, theme_count)
-
