@@ -17,8 +17,53 @@ let themeChartInstance = null;
 let sentimentChartInstance = null;
 let currentReviewsPage = 1;
 const REVIEWS_PER_PAGE = 50;
+let authToken = localStorage.getItem('reviewiq_token');
+let userRole = localStorage.getItem('reviewiq_role');
 
 const API_BASE = '/api';
+
+// --- IndexedDB Cache ---
+const CACHE_NAME = 'ReviewIQCache';
+const STORE_NAME = 'apiCache';
+
+function openIDB() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(CACHE_NAME, 1);
+    request.onupgradeneeded = e => e.target.result.createObjectStore(STORE_NAME);
+    request.onsuccess = e => resolve(e.target.result);
+    request.onerror = () => reject('IDB error');
+  });
+}
+
+async function getCache(key) {
+  try {
+    const db = await openIDB();
+    return new Promise(resolve => {
+      const request = db.transaction(STORE_NAME, 'readonly').objectStore(STORE_NAME).get(key);
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => resolve(null);
+    });
+  } catch(e) { return null; }
+}
+
+async function setCache(key, data) {
+  try {
+    const db = await openIDB();
+    const tx = db.transaction(STORE_NAME, 'readwrite');
+    tx.objectStore(STORE_NAME).put(data, key);
+    return new Promise(resolve => {
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+    });
+  } catch(e) {}
+}
+
+async function clearCache() {
+  try {
+    const db = await openIDB();
+    db.transaction(STORE_NAME, 'readwrite').objectStore(STORE_NAME).clear();
+  } catch(e) {}
+}
 
 // --- Initialization ---
 async function init() {
@@ -28,20 +73,31 @@ async function init() {
   setupSettings();
   setupExplorer();
   setupPdfExport();
-  await setupProductFilter();
+  setupLogin();
 
-  // Load Initial Data
+  if (!authToken) {
+    showLoginModal();
+    return;
+  }
+  await loadInitialData();
+}
+
+async function loadInitialData() {
+  await setupProductFilter();
   await loadDashboard();
   await loadSettings();
   await checkTrends();
-
-  // Setup Server-Sent Events for Progress
   setupSSE();
 }
 
 // --- API Helpers ---
-async function fetchAPI(endpoint, method = 'GET', body = null, skipProductInjection = false) {
+async function fetchAPI(endpoint, method = 'GET', body = null, skipProductInjection = false, useCache = false) {
   const options = { method, headers: {} };
+  
+  if (authToken) {
+    options.headers['Authorization'] = `Bearer ${authToken}`;
+  }
+
   if (body) {
     options.headers['Content-Type'] = 'application/json';
     options.body = JSON.stringify(body);
@@ -53,12 +109,29 @@ async function fetchAPI(endpoint, method = 'GET', body = null, skipProductInject
     finalEndpoint += `${sep}product=${encodeURIComponent(activeProduct)}`;
   }
   
+  if (useCache && method === 'GET') {
+    const cached = await getCache(finalEndpoint);
+    if (cached) {
+      fetch(`${API_BASE}${finalEndpoint}`, options).then(res => res.json()).then(data => setCache(finalEndpoint, data)).catch(e=>{});
+      return cached;
+    }
+  }
+  
   const res = await fetch(`${API_BASE}${finalEndpoint}`, options);
   if (!res.ok) {
+    if (res.status === 401 && endpoint !== '/login') {
+      logout();
+      throw new Error('Unauthorized');
+    }
     const err = await res.json().catch(() => ({}));
     throw new Error(err.error || `API error: ${res.status}`);
   }
-  return await res.json();
+  
+  const data = await res.json();
+  if (useCache && method === 'GET') {
+      await setCache(finalEndpoint, data);
+  }
+  return data;
 }
 
 function setupSSE() {
@@ -137,7 +210,7 @@ async function setupProductFilter() {
 
 async function loadMetadataSchema() {
   try {
-    metadataSchema = await fetchAPI('/metadata_schema');
+    metadataSchema = await fetchAPI('/metadata_schema', 'GET', null, false, true);
     
     // Update dynamic filters
     const container = document.getElementById('dynamic-filters-container');
@@ -184,8 +257,8 @@ function switchView(targetId) {
 // --- Data Loading & Dashboard ---
 async function loadDashboard() {
   try {
-    const settings = await fetchAPI('/settings');
-    const trends = await fetchAPI('/trends');
+    const settings = await fetchAPI('/settings', 'GET', null, false, true);
+    const trends = await fetchAPI('/trends', 'GET', null, false, true);
     
     // Fetch Data for Product A
     let urlA = `/stats`;
@@ -194,8 +267,8 @@ async function loadDashboard() {
         urlA += `?product=${encodeURIComponent(activeProduct)}`;
         themesUrlA += `?product=${encodeURIComponent(activeProduct)}`;
     }
-    const statsA = await fetchAPI(urlA, 'GET', null, true);
-    const themesA = await fetchAPI(themesUrlA, 'GET', null, true);
+    const statsA = await fetchAPI(urlA, 'GET', null, true, true);
+    const themesA = await fetchAPI(themesUrlA, 'GET', null, true, true);
     
     let statsB = null;
     let themesB = null;
@@ -203,8 +276,8 @@ async function loadDashboard() {
     if (compareProduct) {
         let urlB = `/stats?product=${encodeURIComponent(compareProduct)}`;
         let themesUrlB = `/themes?product=${encodeURIComponent(compareProduct)}`;
-        statsB = await fetchAPI(urlB, 'GET', null, true);
-        themesB = await fetchAPI(themesUrlB, 'GET', null, true);
+        statsB = await fetchAPI(urlB, 'GET', null, true, true);
+        themesB = await fetchAPI(themesUrlB, 'GET', null, true, true);
     }
     
     if (compareProduct) {
@@ -546,21 +619,36 @@ function setStatus(msg, isBusy) {
 }
 
 // --- Explorer ---
-function setupExplorer() {
-  document.getElementById('btn-prev-page').addEventListener('click', () => {
-    if (currentReviewsPage > 1) { currentReviewsPage--; loadExplorer(); }
-  });
-  document.getElementById('btn-next-page').addEventListener('click', () => {
-    currentReviewsPage++; loadExplorer();
-  });
+let isFetchingExplorer = false;
+let observer = null;
+let hasMoreReviews = true;
 
-  const triggerSearch = debounce(() => { currentReviewsPage = 1; loadExplorer(); }, 300);
+function setupExplorer() {
+  const sentinel = document.getElementById('scroll-sentinel');
+  observer = new IntersectionObserver(async (entries) => {
+    if (entries[0].isIntersecting && !isFetchingExplorer && hasMoreReviews) {
+      currentReviewsPage++;
+      await loadExplorer(true);
+    }
+  }, { root: document.getElementById('explorer-table-container'), threshold: 0.1 });
+  
+  if (sentinel) observer.observe(sentinel);
+
+  const triggerSearch = debounce(() => { 
+    currentReviewsPage = 1; 
+    hasMoreReviews = true;
+    loadExplorer(false); 
+  }, 300);
+  
   document.getElementById('search-input').addEventListener('input', triggerSearch);
   document.getElementById('filter-sentiment').addEventListener('change', triggerSearch);
   document.getElementById('filter-rating').addEventListener('change', triggerSearch);
 }
 
-async function loadExplorer() {
+async function loadExplorer(append = false) {
+  if (isFetchingExplorer) return;
+  isFetchingExplorer = true;
+
   const search = document.getElementById('search-input').value;
   const sentiment = document.getElementById('filter-sentiment').value;
   const rating = document.getElementById('filter-rating').value;
@@ -575,10 +663,20 @@ async function loadExplorer() {
   });
 
   try {
+    const sentinel = document.getElementById('scroll-sentinel');
+    if (sentinel) sentinel.innerText = "Loading more reviews...";
+    
     const reviews = await fetchAPI(`/reviews?${params.toString()}`);
     
     const tbody = document.getElementById('reviews-table-body');
-    tbody.innerHTML = '';
+    if (!append) tbody.innerHTML = '';
+    
+    if (reviews.length < REVIEWS_PER_PAGE) {
+        hasMoreReviews = false;
+        if (sentinel) sentinel.innerText = reviews.length === 0 && !append ? "No reviews found" : "No more reviews";
+    } else {
+        if (sentinel) sentinel.innerText = "";
+    }
     
     reviews.forEach(r => {
       let badgeClass = r.sentiment_label === 'POSITIVE' ? 'pos' : (r.sentiment_label === 'NEGATIVE' ? 'neg' : 'neu');
@@ -604,10 +702,10 @@ async function loadExplorer() {
       `;
       tbody.appendChild(tr);
     });
-
-    document.getElementById('page-indicator').innerText = `Page ${currentReviewsPage}`;
   } catch (err) {
     showToast('Failed to load reviews', 'error');
+  } finally {
+    isFetchingExplorer = false;
   }
 }
 
@@ -712,6 +810,46 @@ function debounce(func, wait) {
     clearTimeout(timeout);
     timeout = setTimeout(() => func.apply(this, args), wait);
   };
+}
+
+function setupLogin() {
+  document.getElementById('btn-login').addEventListener('click', async () => {
+    const user = document.getElementById('login-username').value;
+    const pass = document.getElementById('login-password').value;
+    const errEl = document.getElementById('login-error');
+    
+    try {
+      errEl.style.display = 'none';
+      const res = await fetchAPI('/login', 'POST', { username: user, password: pass });
+      
+      authToken = res.token;
+      userRole = res.role;
+      localStorage.setItem('reviewiq_token', authToken);
+      localStorage.setItem('reviewiq_role', userRole);
+      
+      hideLoginModal();
+      await loadInitialData();
+    } catch(err) {
+      errEl.innerText = err.message || 'Login failed';
+      errEl.style.display = 'block';
+    }
+  });
+}
+
+function showLoginModal() {
+  document.getElementById('login-modal').style.display = 'flex';
+}
+
+function hideLoginModal() {
+  document.getElementById('login-modal').style.display = 'none';
+}
+
+function logout() {
+  authToken = null;
+  userRole = null;
+  localStorage.removeItem('reviewiq_token');
+  localStorage.removeItem('reviewiq_role');
+  showLoginModal();
 }
 
 // Run

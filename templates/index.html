@@ -16,6 +16,24 @@
 </head>
 <body>
   
+  <!-- Login Modal -->
+  <div class="modal-overlay" id="login-modal" style="background: rgba(0,0,0,0.85); z-index: 10000; display: none; align-items: center; justify-content: center;">
+    <div class="modal" style="text-align: center; max-width: 400px; width: 100%;">
+      <h2>Sign In</h2>
+      <p style="color: var(--text-muted); margin-bottom: 20px;">Please login to access ReviewIQ.</p>
+      <div class="form-group" style="text-align: left;">
+        <label>Username</label>
+        <input type="text" id="login-username" class="input-field" value="admin">
+      </div>
+      <div class="form-group" style="text-align: left;">
+        <label>Password</label>
+        <input type="password" id="login-password" class="input-field" value="admin">
+      </div>
+      <button class="btn btn-primary w-100" id="btn-login" style="margin-top: 15px;">Login</button>
+      <p id="login-error" style="color: var(--accent-red); margin-top: 15px; font-size: 0.9rem; display: none;"></p>
+    </div>
+  </div>
+
   <div class="app-container">
     <!-- Sidebar -->
     <nav class="sidebar">
@@ -180,7 +198,7 @@
           <div id="dynamic-filters-container" style="display:inline-flex; gap: 10px;"></div>
         </div>
         
-        <div class="table-container" style="overflow-x: auto;">
+        <div class="table-container" style="overflow-x: auto; max-height: 600px;" id="explorer-table-container">
           <table class="data-table">
             <thead>
               <tr id="reviews-table-header">
@@ -197,11 +215,7 @@
               <!-- JS populated -->
             </tbody>
           </table>
-        </div>
-        <div class="pagination">
-          <button class="btn btn-outline" id="btn-prev-page">Previous</button>
-          <span id="page-indicator">Page 1</span>
-          <button class="btn btn-outline" id="btn-next-page">Next</button>
+          <div id="scroll-sentinel" style="height: 20px; text-align: center; color: var(--text-muted); margin-top: 10px;"></div>
         </div>
       </div>
 

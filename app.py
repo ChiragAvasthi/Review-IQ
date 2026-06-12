@@ -1,18 +1,87 @@
-from flask import Flask, request, jsonify, render_template, Response
+from flask import Flask, request, jsonify, render_template, Response, g
 import time
 import json
+import datetime
 from flask_cors import CORS
+import jwt
+from functools import wraps
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from werkzeug.security import check_password_hash
+
 import database
 import ai_engine
 
 app = Flask(__name__, static_folder='static', template_folder='templates')
 CORS(app)
 
+app.config['SECRET_KEY'] = 'super-secret-local-key'
+
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=["200 per day", "50 per hour"],
+    storage_uri="memory://"
+)
+
+def token_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = None
+        if 'Authorization' in request.headers:
+            parts = request.headers['Authorization'].split()
+            if len(parts) == 2 and parts[0] == 'Bearer':
+                token = parts[1]
+                
+        if not token:
+            return jsonify({'error': 'Token is missing'}), 401
+            
+        try:
+            data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=["HS256"])
+            current_user = database.get_user_by_username(data['username'])
+            if not current_user:
+                return jsonify({'error': 'User not found'}), 401
+            g.user = current_user
+        except:
+            return jsonify({'error': 'Token is invalid'}), 401
+            
+        return f(*args, **kwargs)
+    return decorated
+
+def admin_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not hasattr(g, 'user') or g.user['role'] != 'ADMIN':
+            return jsonify({'error': 'Admin privilege required'}), 403
+        return f(*args, **kwargs)
+    return decorated
+
 @app.route('/')
 def index():
     return render_template('index.html')
 
+@app.route('/api/login', methods=['POST'])
+@limiter.limit("10 per minute")
+def login():
+    data = request.json
+    if not data or not data.get('username') or not data.get('password'):
+        return jsonify({'error': 'Missing credentials'}), 401
+        
+    user = database.get_user_by_username(data.get('username'))
+    if user and check_password_hash(user['password_hash'], data.get('password')):
+        token = jwt.encode({
+            'username': user['username'],
+            'role': user['role'],
+            'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=24)
+        }, app.config['SECRET_KEY'], algorithm="HS256")
+        
+        return jsonify({'token': token, 'role': user['role']})
+        
+    return jsonify({'error': 'Invalid credentials'}), 401
+
 @app.route('/api/import', methods=['POST'])
+@token_required
+@admin_required
 def import_data():
     try:
         payload = request.json
@@ -24,7 +93,6 @@ def import_data():
             
         imported, duplicates = database.import_reviews(reviews, skip_duplicates)
         
-        # Trigger background analysis
         ai_engine.trigger_analysis()
         
         return jsonify({'imported': imported, 'duplicates': duplicates})
@@ -32,21 +100,25 @@ def import_data():
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/stats', methods=['GET'])
+@token_required
 def get_stats():
     product = request.args.get('product')
     return jsonify(database.get_stats(product))
 
 @app.route('/api/themes', methods=['GET'])
+@token_required
 def get_themes():
     product = request.args.get('product')
     return jsonify(database.get_themes(product))
 
 @app.route('/api/sources', methods=['GET'])
+@token_required
 def get_sources():
     product = request.args.get('product')
     return jsonify(database.get_source_counts(product))
 
 @app.route('/api/reviews', methods=['GET'])
+@token_required
 def get_reviews():
     try:
         page = int(request.args.get('page', 1))
@@ -60,13 +132,11 @@ def get_reviews():
         if request.args.get('source'): filters['source'] = request.args.get('source')
         
         import re
-        # Extract dynamic metadata filters from query params
         meta_filters = {}
         for key, val in request.args.items():
             if key.startswith('meta_') and val:
                 meta_filters[key[5:]] = val
 
-        # Advanced Regex Parser for Search String Filters (e.g. rating:5 source:"App Store" battery)
         if search:
             pattern = r'(\w+):(?:([^" \n]+)|"([^"\n]+)")'
             matches = re.finditer(pattern, search)
@@ -79,7 +149,6 @@ def get_reviews():
                 else:
                     meta_filters[key] = val
                     
-            # Strip the extracted filters from the search string
             search = re.sub(pattern, '', search).strip()
             
         if meta_filters:
@@ -95,22 +164,30 @@ def get_reviews():
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/trends', methods=['GET'])
+@token_required
 def get_trends():
     product = request.args.get('product')
     return jsonify(database.get_trends(product))
 
 @app.route('/api/products', methods=['GET'])
+@token_required
 def get_products():
     return jsonify(database.get_products())
 
 @app.route('/api/metadata_schema', methods=['GET'])
+@token_required
 def get_metadata_schema():
     product = request.args.get('product')
     return jsonify(database.get_metadata_schema(product))
 
 @app.route('/api/settings', methods=['GET', 'POST'])
+@token_required
 def handle_settings():
     if request.method == 'POST':
+        # Need admin to change settings
+        if g.user['role'] != 'ADMIN':
+            return jsonify({'error': 'Admin privilege required'}), 403
+            
         settings = request.json
         updated = database.save_settings(settings)
         return jsonify(updated)
@@ -118,6 +195,8 @@ def handle_settings():
         return jsonify(database.get_settings())
 
 @app.route('/api/clear', methods=['POST'])
+@token_required
+@admin_required
 def clear_data():
     database.clear_data()
     return jsonify({'success': True})
@@ -139,6 +218,8 @@ def stream_progress():
     return Response(event_stream(), mimetype="text/event-stream")
 
 @app.route('/api/rerun_ai', methods=['POST'])
+@token_required
+@admin_required
 def rerun_ai():
     settings = database.get_settings()
     theme_count = int(settings.get('theme_count', 6))

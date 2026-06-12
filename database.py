@@ -3,6 +3,7 @@ import uuid
 import datetime
 import hashlib
 import json
+from werkzeug.security import generate_password_hash
 
 DB_PATH = 'reviewiq.db'
 
@@ -103,6 +104,13 @@ def init_db():
             key TEXT PRIMARY KEY,
             value TEXT
         );
+        
+        CREATE TABLE IF NOT EXISTS users (
+            id TEXT PRIMARY KEY,
+            username TEXT UNIQUE,
+            password_hash TEXT,
+            role TEXT
+        );
     ''')
     
     # Safe migrations for existing databases
@@ -123,11 +131,26 @@ def init_db():
     for key, value in defaults.items():
         c.execute('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)', (key, value))
         
+    # Seed default admin user
+    c.execute('SELECT * FROM users WHERE username = ?', ('admin',))
+    if not c.fetchone():
+        pwd_hash = generate_password_hash('admin')
+        c.execute('INSERT INTO users (id, username, password_hash, role) VALUES (?, ?, ?, ?)',
+                  (str(uuid.uuid4()), 'admin', pwd_hash, 'ADMIN'))
+        
     conn.commit()
     conn.close()
 
 def generate_hash(text):
     return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+def get_user_by_username(username):
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute('SELECT * FROM users WHERE username = ?', (username,))
+    user = c.fetchone()
+    conn.close()
+    return dict(user) if user else None
 
 def import_reviews(reviews_list, skip_duplicates=True):
     conn = get_connection()
